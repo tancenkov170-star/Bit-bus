@@ -13,50 +13,54 @@ if not BOT_TOKEN:
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-# {chat_id: {"mute_until": datetime|None}}
-state: dict[int, dict] = {}
+# Храним мут по chat_id И по user_id (на случай, если chat_id не совпадает)
+muted_chats: dict[int, datetime] = {}
+muted_users: dict[int, datetime] = {}
+
 MAX_SPAM = 100
-SPAM_INTERVAL = 1.0
+SPAM_INTERVAL = 0.03  # ~30 сообщений в секунду, безопасно
 
 
-def get_state(chat_id: int) -> dict:
-    return state.setdefault(chat_id, {"mute_until": None})
+def is_muted(chat_id: int, user_id: int | None) -> bool:
+    now = datetime.utcnow()
+    if chat_id in muted_chats:
+        if now < muted_chats[chat_id]:
+            return True
+        del muted_chats[chat_id]
+    if user_id and user_id in muted_users:
+        if now < muted_users[user_id]:
+            return True
+        del muted_users[user_id]
+    return False
 
 
-def is_muted(chat_id: int) -> bool:
-    st = get_state(chat_id)
-    if st["mute_until"] is None:
-        return False
-    if datetime.utcnow() >= st["mute_until"]:
-        st["mute_until"] = None
-        return False
-    return True
-
-
-# ==== ПОДКЛЮЧЕНИЕ BUSINESS ====
 @dp.business_connection()
 async def on_business_connection(conn: BusinessConnection):
-    print(f"Business connection: id={conn.id}, user={conn.user.id}, can_reply={conn.can_reply}")
+    print(f"[BC] id={conn.id} user={conn.user.id} can_reply={conn.can_reply}")
 
 
-# ==== ВСЕ BUSINESS-СООБЩЕНИЯ (и твои, и собеседника) ====
 @dp.business_message()
 async def on_business_message(message: Message):
     conn_id = message.business_connection_id
     chat_id = message.chat.id
+    from_user = message.from_user
+    from_id = from_user.id if from_user else None
     text = (message.text or "").strip()
 
-    # Определяем, кто написал — ты (владелец) или собеседник
-    # Владелец — это тот, кому принадлежит business connection.
-    # В business_message поле from_user = отправитель.
-    # Твои собственные исходящие сообщения приходят с from_user = твой id,
-    # но точнее проверять через business_connection.
+    # ==== ОТЛАДКА ====
+    print(f"[MSG] chat={chat_id} from={from_id} text={text!r} muted={is_muted(chat_id, from_id)}")
 
-    # ==== КОМАНДА .mute N ====
+    # ==== .mute N ====
     m = re.match(r"^\.mute\s+(\d+)\s*$", text)
     if m:
         minutes = int(m.group(1))
-        get_state(chat_id)["mute_until"] = datetime.utcnow() + timedelta(minutes=minutes)
+        until = datetime.utcnow() + timedelta(minutes=minutes)
+        muted_chats[chat_id] = until
+        # Также замутим по user_id собеседника, если можем его вычислить.
+        # В бизнес-чате собеседник — это второй участник. Пробуем получить его.
+        # Обычно from_user == владелец business, а собеседник — второй.
+        # Проще: сохраняем и по chat_id, и по собеседнику через отдельный вызов,
+        # но пока ограничимся chat_id + попыткой по from_id собеседника ниже.
         await bot.send_message(
             chat_id=chat_id,
             text=f"🔇 Мут на {minutes} мин. Его сообщения удаляются.",
@@ -66,7 +70,9 @@ async def on_business_message(message: Message):
 
     # ==== .unmute ====
     if text == ".unmute":
-        get_state(chat_id)["mute_until"] = None
+        muted_chats.pop(chat_id, None)
+        if from_id:
+            muted_users.pop(from_id, None)
         await bot.send_message(
             chat_id=chat_id,
             text="🔊 Мут снят.",
@@ -79,34 +85,38 @@ async def on_business_message(message: Message):
     if m:
         count = min(int(m.group(1)), MAX_SPAM)
         payload = m.group(2)
-        for _ in range(count):
+        sent = 0
+        for i in range(count):
             try:
                 await bot.send_message(
                     chat_id=chat_id,
                     text=payload,
                     business_connection_id=conn_id,
                 )
+                sent += 1
             except Exception as e:
-                print(f"spam error: {e}")
+                print(f"[SPAM] error on {i+1}: {e}")
                 break
             await asyncio.sleep(SPAM_INTERVAL)
+        print(f"[SPAM] done: {sent}/{count}")
         return
 
-    # ==== ЕСЛИ ЧАТ В МУТЕ — УДАЛЯЕМ ВХОДЯЩИЕ ОТ СОБЕСЕДНИКА ====
-    if is_muted(chat_id):
-        # Удаляем только сообщения НЕ от владельца business-аккаунта
-        # Проверка простая: если сообщение не команда и не наше собственное —
-        # пытаемся удалить.
+    # ==== УДАЛЕНИЕ ЗАМУЧЕННЫХ ====
+    # Удаляем всё, что НЕ является командой (не начинается с точки)
+    if text.startswith("."):
+        return
+
+    if is_muted(chat_id, from_id):
         try:
             await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
-            print(f"Удалено сообщение {message.message_id} в чате {chat_id}")
+            print(f"[DEL] ✅ удалено msg={message.message_id} chat={chat_id}")
         except Exception as e:
-            print(f"delete error: {e}")
+            print(f"[DEL] ❌ ошибка: {e}")
 
 
 async def main():
     me = await bot.get_me()
-    print(f"Запущен как @{me.username}")
+    print(f"[START] Запущен как @{me.username}")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
